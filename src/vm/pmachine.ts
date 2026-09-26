@@ -487,15 +487,66 @@ export class PMachine {
     return this.locals.get(n) ?? new Int32Array(0);
   }
 
+  /**
+   * Every clone the game can still reach, from the roots outwards.
+   *
+   * SCI frees a disposed clone at the next garbage collection, and
+   * collection is by reachability: what nothing holds a reference to is
+   * gone whether it was disposed or not.  Here collection happens when
+   * a cycle begins, which is never while a modal dialog is up -- the
+   * dialog polls `GetEvent` in a loop, cloning an `Event` each time
+   * round, and the machine suspends and resumes that one cycle rather
+   * than starting another.  A saved game made in the save dialog
+   * therefore carried a hundred and fifty thousand dead events: thirteen
+   * megabytes, three times what a browser will store, so the save was
+   * written nowhere, silently, and was gone as soon as the game was
+   * left.  What is still reachable is seventy.
+   *
+   * The roots are the globals, every script's locals, the value stack --
+   * which is where a suspended cycle keeps the event it is working on --
+   * and the properties of everything already reached.
+   */
+  private reachableClones(): Set<number> {
+    const seen = new Set<number>();
+    const queue: number[] = [];
+    // Nothing recurses: a node chain is as long as the list it belongs
+    // to, and a list of a hundred and fifty thousand dead events walked
+    // by recursion is a stack overflow, which stopped the game dead in
+    // the middle of saving.  Lists and nodes are all roots anyway --
+    // every one of them is kept by the save -- so reaching a clone
+    // through one needs no walk of its own.
+    const visit = (v: number) => {
+      if (!isRef(v) || seen.has(v) || !this.clones.has(v)) return;
+      seen.add(v); queue.push(v);
+    };
+    for (const v of this.globals) visit(v);
+    for (const v of this.stack) visit(v);
+    for (const ls of this.locals.values()) for (const v of ls) visit(v);
+    for (const o of this.objects.values()) for (const v of o.props) visit(v);
+    for (const l of this.lists.values()) { visit(l.first); visit(l.last); }
+    for (const n of this.nodes.values()) { visit(n.key); visit(n.value); visit(n.prev); visit(n.next); }
+    while (queue.length) {
+      const o = this.clones.get(queue.pop()!);
+      if (o) for (const v of o.props) visit(v);
+    }
+    return seen;
+  }
+
   /** The state a saved game keeps, as ScummVM's serialiser keeps it. */
   snapshot(): Snapshot {
+    const reachable = this.reachableClones();
     return {
       globals: Array.from(this.globals),
       locals: [...this.locals].map(([n, v]) => [n, Array.from(v)] as [number, number[]]),
       objects: [...this.objects].map(([k, o]) => [k, Array.from(o.props)] as [string, number[]]),
-      clones: [...this.clones].map(([h, o]) =>
-        [h, { script: o.scriptNo, offset: o.def.offset, props: Array.from(o.props) }] as
-          [number, { script: number; offset: number; props: number[] }]),
+      // Only the clones the game can still get at.  A save made from
+      // inside a dialog is otherwise mostly the dialog's own discarded
+      // events -- see `reachable`.
+      clones: [...this.clones]
+        .filter(([h]) => reachable.has(h))
+        .map(([h, o]) =>
+          [h, { script: o.scriptNo, offset: o.def.offset, props: Array.from(o.props) }] as
+            [number, { script: number; offset: number; props: number[] }]),
       lists: [...this.lists].map(([h, l]) => [h, { ...l }] as [number, { first: number; last: number }]),
       nodes: [...this.nodes].map(([h, n]) => [h, { ...n }] as
         [number, { key: number; value: number; prev: number; next: number }]),

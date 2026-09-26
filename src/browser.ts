@@ -556,32 +556,54 @@ function pumpAudio(s: Session) {
 }
 
 /**
- * Saved games, kept for as long as the tab is open.
+ * Saved games, kept in the browser.
  *
  * A cookie was the obvious place and will not do: one holds about four
- * kilobytes and a King's Quest IV save is fifty, being every global,
- * every script's locals and four hundred clones.  `sessionStorage` is
- * the same lifetime -- this tab, until it closes -- with room for it,
- * so that is where they go.  Nothing is sent anywhere.
+ * kilobytes and a King's Quest IV save is fourteen, being every global,
+ * every script's locals and the clones the game can still reach.
+ * `sessionStorage` was the next place and will not do either, for the
+ * reason the saves kept disappearing: it lasts exactly as long as the
+ * tab, so leaving the game and coming back to it later found nothing.
+ * `localStorage` is the same thing without that limit.  Either way
+ * nothing is sent anywhere and the server needs nowhere to put it.
  *
  * Each game has its own drawer, because slot 1 means something
  * different in each.
  */
 const savesKey = () => `sci0n:saves:${gameName || 'game'}`;
 
+/** Wherever this browser will let us keep them, longest-lived first. */
+function drawer(): Storage | null {
+  for (const get of [() => localStorage, () => sessionStorage]) {
+    try {
+      const st = get();
+      st.setItem('sci0n:probe', '1');
+      st.removeItem('sci0n:probe');
+      return st;
+    } catch { /* blocked, private mode, or full: try the next */ }
+  }
+  return null;
+}
+
 function keepSaves(s: Session) {
+  const text = JSON.stringify([...s.saves]);
   try {
-    sessionStorage.setItem(savesKey(), JSON.stringify([...s.saves]));
-  } catch {
-    // A full or blocked store is not worth losing the game over; the
-    // save still stands for this session, it just will not outlive a
-    // reload.
+    const st = drawer();
+    if (!st) throw new Error('this browser is not storing anything');
+    st.setItem(savesKey(), text);
+    $('gameinfo').textContent = `${s.saves.size} saved game${s.saves.size === 1 ? '' : 's'} kept in this browser`;
+  } catch (err) {
+    // Losing it quietly is what made this hard to see: the save worked,
+    // restoring worked, and it was gone the moment the game was left.
+    console.warn('sci0n: could not keep the saved games', err);
+    $('gameinfo').textContent =
+      `saved for now, but this browser would not keep it (${Math.round(text.length / 1024)}KB): ${(err as Error).message}`;
   }
 }
 
 function loadSaves(s: Session) {
   try {
-    const raw = sessionStorage.getItem(savesKey());
+    const raw = localStorage.getItem(savesKey()) ?? sessionStorage.getItem(savesKey());
     if (!raw) return;
     for (const [slot, entry] of JSON.parse(raw) as Array<[number, { name: string; snap: never }]>)
       s.saves.set(slot, entry);
@@ -815,6 +837,9 @@ const hex = (n: number, w = 4) => n.toString(16).padStart(w, '0');
 
 /** Swap the stage between the canvas and the text pane. */
 function stageMode(text: boolean) {
+  // The title artwork is only the opening view; resources and play own the stage after it.
+  const cover = document.getElementById('cover');
+  if (cover) cover.hidden = true;
   ($('cv') as HTMLElement).hidden = text;
   ($('text') as HTMLElement).hidden = !text;
   $('stage').className = text ? 'text' : '';

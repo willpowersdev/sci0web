@@ -128,6 +128,27 @@ press(ENTER, 60);
 check(s.saves.get(1)?.name === 'past the rocks' && s.saves.get(0)?.name === 'by the sea',
   `a new name takes a slot of its own: ${JSON.stringify([...s.saves].map(([k, v]) => `${k}:${v.name}`))}`);
 
+/**
+ * Small enough for a browser to keep, and the same after a round trip.
+ *
+ * Both saves were made from inside the dialog, which is one cycle that
+ * never ends -- it polls `GetEvent` in a loop, cloning an `Event` each
+ * time round, and nothing is collected until a cycle begins.  Saving
+ * every clone still in the machine wrote thirteen megabytes, three
+ * times what a browser will store, so the page kept nothing: the save
+ * worked, restoring worked while the game was up, and it was gone as
+ * soon as the game was left.  Only what the game can still reach is
+ * part of the save.
+ *
+ * The catalogue is then put back from its own JSON, so what the restore
+ * below works from is exactly what a browser would have handed back.
+ */
+const text = JSON.stringify([...s.saves]);
+check(text.length < 256 * 1024,
+  `both saved games together are ${Math.round(text.length / 1024)}KB, small enough to keep`);
+s.saves.clear();
+for (const [slot, e] of JSON.parse(text)) s.saves.set(slot, e);
+
 // The restore dialog, and the room the save was made in.
 controls = [];
 drawn = [];
