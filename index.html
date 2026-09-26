@@ -110,4 +110,9 @@
 <div id="hud" hidden></div>
 <div style="display:none">
 </div>
-<script type="module" src="./dist/app.js"></script>
+<!--
+  The bundle is served through a CDN that caches it for hours, so a
+  deploy the page asks for by name is a deploy nobody sees.  The
+  query is the build it wants; the page itself is never cached.
+-->
+<script type="module" src="./dist/app.js?v=bb0a122a"></script>
