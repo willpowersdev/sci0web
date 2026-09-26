@@ -1324,9 +1324,13 @@ export class PMachine {
     this.screen.frame(x - 1, y - 1, x + w + 1, bottom + 1, pen);
     // The arrows sit in the nine pixels at each end, and the lines run
     // between them.
+    // In the font the port is using, not the one the list is set to:
+    // ScummVM draws the arrows before it switches fonts, and the dialogs
+    // set the list to font 4, whose characters 24 and 25 are blank.
+    const sys = this.font(0) ?? font;
     const arrow = (c: string, ty: number) => {
-      const wide = font.chars[c.charCodeAt(0)]?.width ?? 0;
-      this.screen.text(font, c, x + Math.max(0, (w - wide) >> 1), ty, pen);
+      const wide = sys.chars[c.charCodeAt(0)]?.width ?? 0;
+      this.screen.text(sys, c, x + Math.max(0, (w - wide) >> 1), ty, pen);
     };
     arrow('\x18', y);
     arrow('\x19', bottom - 9);
