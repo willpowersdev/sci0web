@@ -112,8 +112,21 @@ export class Session {
     this.begin();
   }
 
-  /** Build the machine and find `play`, which is also what a restart does. */
-  private begin() {
+  /**
+   * Build the machine and find where the game starts.
+   *
+   * `play` for a new game and for a restart; `replay` after a restore,
+   * and the difference matters.  ScummVM re-enters the game object at
+   * `replay` when a save is loaded and at `play` otherwise, and the
+   * scripts are written for it: `Game::play` calls `init`, and
+   * `KQ4::init` asks `GameIsRestarting` and, whenever the answer is
+   * anything but no, sends the player to room 25.  Coming back through
+   * `play` therefore put Rosella on the beach whatever room the save
+   * was made in, with everything else about the save correctly
+   * restored.  `Game::replay` instead redraws the room the restored
+   * globals name and hands control back.
+   */
+  private begin(entry: string[] = ['play', 'init']) {
     this.vm = new PMachine(this.game, this.index);
     // The wipes are paced off the same clock the session runs on, so a
     // harness driving frames by hand sees them advance too.
@@ -124,11 +137,14 @@ export class Session {
       return true;
     };
     this.vm.getSave = (slot) => this.saves.get(slot)?.snap ?? null;
+    this.vm.listSaves = () => [...this.saves]
+      .sort((a, b) => a[0] - b[0])
+      .map(([slot, e]) => ({ slot, name: e.name }));
     this.entry = null;
     const obj = this.vm.resolveTarget(null, this.vm.scriptID(0, 0));
     if (!obj) return;
     // Export 0 of script 0 is the game object; `play` is its entry point.
-    for (const name of ['play', 'init']) {
+    for (const name of entry) {
       const sel = this.index.selectorId(name);
       if (sel < 0) continue;
       const f = this.vm.species.lookup(obj.def, sel, obj.scriptNo);
@@ -154,9 +170,7 @@ export class Session {
     this.vm.sounds.stopAll();
     const { undither, statusVisible } = this.vm.screen;
     const output = this.vm.sounds.output;
-    const putSave = this.vm.putSave, getSave = this.vm.getSave;
-    this.begin();
-    this.vm.putSave = putSave; this.vm.getSave = getSave;
+    this.begin(snap ? ['replay', 'play', 'init'] : ['play', 'init']);
     if (snap) this.vm.restoreFrom(snap);
     this.vm.restarting = snap ? RESTORING : RESTARTING;
     this.vm.screen.undither = undither;

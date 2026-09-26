@@ -63,11 +63,27 @@ check(saveGame > 0 && restoreGame > 0, 'the game has both kernels to call');
 const home = where();
 check(st.picture === 25, `she is on the beach (${home})`);
 
-// Saved the way a script does it, into slot 1 with a name.
-const ok = vm().kernel(saveGame, [vm().makeString('kq4'), 1, vm().makeString('by the sea'), 0], null);
+/**
+ * Saved the way a script does it.
+ *
+ * The number the dialog hands over is not a slot.  Sierra's save dialog
+ * counts the games it found and passes that count, and anything below a
+ * hundred means "somewhere new"; a hundred and up names one of the
+ * games the catalogue listed, counting from a hundred.  Passing the
+ * number through as a slot meant every save after the first landed on
+ * top of the one before.
+ */
+const ok = vm().kernel(saveGame, [vm().makeString('kq4'), 0, vm().makeString('by the sea'), 0], null);
 check(ok === 1, `saving answers true for success (${ok}), as kSaveGame does`);
-check(s.saves.get(1)?.name === 'by the sea',
-  `and the slot holds it: ${JSON.stringify(s.saves.get(1)?.name ?? '')}`);
+check(s.saves.get(0)?.name === 'by the sea',
+  `and the first free slot holds it: ${JSON.stringify(s.saves.get(0)?.name ?? '')}`);
+vm().kernel(saveGame, [vm().makeString('kq4'), 1, vm().makeString('and again'), 0], null);
+check(s.saves.get(1)?.name === 'and again' && s.saves.get(0)?.name === 'by the sea',
+  `a second new save takes a slot of its own (${[...s.saves].map(([k, v]) => `${k}:${v.name}`).join(', ')})`);
+vm().kernel(saveGame, [vm().makeString('kq4'), 100, vm().makeString('over the top'), 0], null);
+check(s.saves.get(0)?.name === 'over the top' && s.saves.size === 2,
+  `and a number in the official range replaces that game (${[...s.saves].map(([k, v]) => `${k}:${v.name}`).join(', ')})`);
+vm().kernel(saveGame, [vm().makeString('kq4'), 0, vm().makeString('by the sea'), 0], null);
 
 // Somewhere else entirely.
 for (let k = 0; k < 40 && st.picture === 25; k++) { s.key(0x4D00); step(30); }
@@ -76,10 +92,10 @@ const away = where();
 check(st.picture !== 25, `she walks away to another room (${away})`);
 
 // And back.
-const failedRestore = vm().kernel(restoreGame, [vm().makeString('kq4'), 9, 0], null);
+const failedRestore = vm().kernel(restoreGame, [vm().makeString('kq4'), 109, 0], null);
 check(failedRestore === 1, `restoring a slot that is empty answers true for failure (${failedRestore})`);
 
-const good = vm().kernel(restoreGame, [vm().makeString('kq4'), 1, 0], null);
+const good = vm().kernel(restoreGame, [vm().makeString('kq4'), 102, 0], null);
 check(good === 0, `restoring answers nothing for success (${good}), as kRestoreGame does`);
 step(400);
 check(where() === home, `and she is back where she was saved (${where()}, saved at ${home})`);

@@ -98,6 +98,38 @@ const FRAME_WINDOW = 512;
 const MAX_STACK = 8192;
 /** Frames, not JS stack depth -- an explicit stack can go much deeper. */
 const MAX_FRAMES = 1024;
+/**
+ * Where a `lea` on a temp or a parameter points.
+ *
+ * SCI's stack is memory like any other, and the scripts do arithmetic
+ * on addresses into it.  The saved-game dialog is built on that: the
+ * catalogue of names is one buffer of twenty fixed thirty-six byte
+ * slots, `DSelector` walks it by adding thirty-six to a pointer until
+ * the string it lands on is empty, and `advance` asks for the
+ * character *thirty-six past* the cursor to find out whether there is
+ * another entry below.  A handle that only stands for one variable
+ * answers none of that, so stack addresses get a real address space:
+ * script 0x3FFE, with the byte offset of the slot.  Two bytes to the
+ * word, exactly as the machine has it, so the script's own `index * 18`
+ * words and the kernel's `i * 36` bytes name the same place.
+ */
+const STACK_SPACE = 0x3FFE;
+/**
+ * The shape of the saved-game catalogue, which the scripts know too.
+ *
+ * Twenty is as many as a Sierra dialog will list, thirty-six bytes is
+ * the slot each name occupies, and the numbers the scripts are given
+ * for the games that exist start at a hundred: anything below that, when
+ * it comes back, means "somewhere new", which is how the dialog asks for
+ * a save rather than a replacement.  All three are ScummVM's, which took
+ * them from the interpreter.
+ */
+const MAX_SAVES = 20, SAVE_NAME_LEN = 36, SAVE_ID_BASE = 100;
+/** The saved game a number from the scripts names. */
+const slotOf = (id: number) =>
+  id >= SAVE_ID_BASE && id < SAVE_ID_BASE + 100 ? id - SAVE_ID_BASE : id;
+const stackAddr = (word: number) => makeRef(STACK_SPACE, word * 2);
+const isStackAddr = (v: number) => isRef(v) && refScript(v) === STACK_SPACE;
 
 /**
  * SCI0 event types, as the scripts test them.
@@ -163,6 +195,7 @@ export const WINDOW_NODRAW = 0x08;
  * runs beside the question.
  */
 export const CONTROL_ICON = 4;
+export const CONTROL_LIST = 6;
 
 /**
  * Signal bits that say an actor is not there to be bumped into.
@@ -518,6 +551,30 @@ export class PMachine {
   /** Where a saved game is kept, which is the host's business. */
   putSave: ((slot: number, snap: Snapshot, name: string) => boolean) | null = null;
   getSave: ((slot: number) => Snapshot | null) | null = null;
+  /** What is in the drawer, oldest slot first, for the game's own dialog. */
+  listSaves: (() => Array<{ slot: number; name: string }>) | null = null;
+  /** The save directory the scripts pass around; one string, reused. */
+  private saveDir = 0;
+
+  /**
+   * Which slot a save should go to.
+   *
+   * A number in the official range names a game that already exists and
+   * is being replaced; anything below it means the dialog wants a slot
+   * of its own, and the lowest free one is it.  Sierra's dialog passes
+   * the number of games it found, so without this every save after the
+   * first overwrote the one before.
+   */
+  private slotToWrite(id: number): number {
+    const taken = new Set((this.listSaves?.() ?? []).map(e => e.slot));
+    if (id >= SAVE_ID_BASE && id < SAVE_ID_BASE + 100) {
+      const slot = id - SAVE_ID_BASE;
+      return taken.has(slot) ? slot : -1;
+    }
+    let slot = 0;
+    while (taken.has(slot)) slot++;
+    return slot;
+  }
   /** A restore waiting for the machine to be built again. */
   restoreRequested: Snapshot | null = null;
 
@@ -827,7 +884,11 @@ export class PMachine {
           case 'toss': st.pop(); break;
           case 'dup': st.push(st[st.length - 1] ?? 0); break;
           case 'pprev': st.push(this.prev); break;
-          case 'link': for (let i = 0; i < a[0]; i++) st.push(0); break;
+          case 'link':
+            // The temps start empty, and so does the text behind them.
+            this.clearStackText(st.length, a[0]);
+            for (let i = 0; i < a[0]; i++) st.push(0);
+            break;
           case 'class': {
             // Names the class object for a species, which is how a script
             // sends to a class it does not hold a reference to.
@@ -1229,6 +1290,58 @@ export class PMachine {
    * always at the end, so moving along the line with the arrow keys
    * shows.
    */
+  /**
+   * The saved-game list, which is a control like any other.
+   *
+   * `text` points at the first of a run of fixed-width entries -- the
+   * width is the control's own `x`, thirty-six for every SCI0 save
+   * dialog -- ended by an empty one.  `cursor` and `lsTop` are pointers
+   * into that same run, not indices, so which line is picked and which
+   * is at the top are both found by subtracting.
+   *
+   * The furniture is ScummVM's reading of the original: a frame around
+   * the whole, an up arrow at the top and a down arrow at the bottom
+   * (characters 24 and 25 of the font), and a second frame around the
+   * lines between them.  The picked line is drawn in reverse.
+   */
+  private drawList(o: RtObject, x: number, y: number, w: number, bottom: number,
+                   font: Font | null, pen = 0, back = 15) {
+    if (!font) return;
+    const base = this.prop(o, 'text');
+    const stride = this.prop(o, 'x', SAVE_NAME_LEN) || SAVE_NAME_LEN;
+    const entries: string[] = [];
+    for (let i = 0; i < MAX_SAVES; i++) {
+      const t = this.stringAt(base + i * stride, o.scriptNo);
+      if (!t) break;
+      entries.push(t);
+    }
+    const index = (ptr: number) =>
+      !ptr || ptr < base ? 0 : Math.floor((ptr - base) / stride);
+    const top = index(this.prop(o, 'lsTop'));
+    const cursor = index(this.prop(o, 'cursor'));
+    const h = Math.max(8, font.lineHeight);
+    this.screen.fill(x, y, x + w, bottom, back);
+    this.screen.frame(x - 1, y - 1, x + w + 1, bottom + 1, pen);
+    // The arrows sit in the nine pixels at each end, and the lines run
+    // between them.
+    const arrow = (c: string, ty: number) => {
+      const wide = font.chars[c.charCodeAt(0)]?.width ?? 0;
+      this.screen.text(font, c, x + Math.max(0, (w - wide) >> 1), ty, pen);
+    };
+    arrow('\x18', y);
+    arrow('\x19', bottom - 9);
+    this.screen.frame(x, y + 9, x + w, bottom - 9, pen);
+    for (let i = top, ty = y + 10; i < entries.length && ty + h <= bottom - 10; i++, ty += h) {
+      const line = entries[i].slice(0, stride);
+      if (i === cursor) {
+        this.screen.fill(x + 1, ty, x + w - 1, ty + h, pen);
+        this.screen.text(font, line, x + 2, ty, back);
+      } else {
+        this.screen.text(font, line, x + 2, ty, pen);
+      }
+    }
+  }
+
   private drawEditField(o: RtObject, x: number, y: number, w: number,
                         font: Font | null, pen = 0, back = 15) {
     if (!font) return;
@@ -1745,24 +1858,10 @@ export class PMachine {
    * each pixel still tested against the picture's own priority, which is
    * what puts an actor behind scenery rather than in front of it.
    */
-  /**
-   * Which cycle the cast was last walked, for the animation counters.
-   *
-   * Stopped views used to be tracked here as well, with their own
-   * rectangles and rules about when to put the picture back over them.
-   * They are ordinary members of the cast now: ScummVM saves the bits
-   * under a `noUpdate` cel and restores them every cycle exactly as it
-   * does for an animating one, and the only thing that makes a stopped
-   * view stay on the screen is leaving the cast, where there is nothing
-   * left to put it back.
-   */
-  private castEpoch = 0;
-
   /** Everything about a view that decides what lands on the screen. */
 
   private drawCast(castH: number) {
     this.showPendingPic();
-    this.castEpoch++;
     /**
      * Everything in the cast, drawn or not, and what each will draw.
      *
@@ -2548,18 +2647,18 @@ export class PMachine {
         // it, so the caller can go on using the address it passed in.
         const text = this.textLines(a0)[a1] ?? '';
         const buf = args[2] ?? 0;
-        if (this.strings.has(buf)) { this.strings.set(buf, text); return buf; }
+        if (this.hasString(buf)) { this.setString(buf, text); return buf; }
         return this.makeString(text);
       }
       case 'Format': {
         // Format(dest, source, ...) writes into dest and returns it; the
         // source may be a string or a (resource, line) pair.
         let i = 1, src: string;
-        if (this.strings.has(a1) || isRef(a1)) { src = this.stringAt(a1, f?.scriptNo); i = 2; }
+        if (this.hasString(a1) || isRef(a1)) { src = this.stringAt(a1, f?.scriptNo); i = 2; }
         else { src = this.textLines(a1)[args[2] ?? 0] ?? ''; i = 3; }
         const out = this.format(src, args.slice(i), f?.scriptNo);
         if (!a0) return this.makeString(out);
-        this.strings.set(a0, out);
+        this.setString(a0, out);
         return a0;
       }
       /**
@@ -2583,11 +2682,11 @@ export class PMachine {
         // to mean "as many as fit", which is the same as no limit here.
         const n = args.length > 2 ? s16(u16(args[2])) : -1;
         const src = this.stringAt(a1, f?.scriptNo);
-        this.strings.set(a0, n >= 0 ? src.slice(0, n) : src);
+        this.setString(a0, n >= 0 ? src.slice(0, n) : src);
         return a0;
       }
       case 'StrCat': {
-        this.strings.set(a0, this.stringAt(a0, f?.scriptNo) + this.stringAt(a1, f?.scriptNo));
+        this.setString(a0, this.stringAt(a0, f?.scriptNo) + this.stringAt(a1, f?.scriptNo));
         return a0;
       }
       case 'StrCmp': {
@@ -2601,14 +2700,32 @@ export class PMachine {
         return this.stringAt(a0, f?.scriptNo).length;
       }
       case 'StrAt': {
-        const t = this.stringAt(a0, f?.scriptNo);
         const i = Math.max(0, s16(u16(a1)));
+        /**
+         * A byte, and past the end of the string is still a byte.
+         *
+         * `DSelector::advance` asks for the character a whole entry
+         * along -- thirty-six past the cursor -- to find out whether
+         * there is another line below the one picked.  Reading that out
+         * of the string the cursor points at answers nothing, because
+         * the string stopped at its terminator thirty-odd bytes back,
+         * and the saved-game list would not scroll past its first
+         * entry.
+         */
+        if (isStackAddr(a0)) {
+          const at = refOffset(a0) + i;
+          const was = at < this.stackBytes.length ? this.stackBytes[at] : 0;
+          if (args.length > 2 && at < this.stackBytes.length)
+            this.stackBytes[at] = args[2] & 0xFF;
+          return was;
+        }
+        const t = this.stringAt(a0, f?.scriptNo);
         const was = t.charCodeAt(i) || 0;
         // With a third argument it writes that character and reports
         // the one it replaced.
         if (args.length > 2) {
           const pad = t.length < i ? t + ' '.repeat(i - t.length) : t;
-          this.strings.set(a0, pad.slice(0, i) + String.fromCharCode(args[2] & 0xFF) + pad.slice(i + 1));
+          this.setString(a0, pad.slice(0, i) + String.fromCharCode(args[2] & 0xFF) + pad.slice(i + 1));
         }
         return was;
       }
@@ -2703,6 +2820,21 @@ export class PMachine {
         // 6 list.  Zero is not one of them, but the games pass it for a
         // plain button and it has always been taken as one here.
         const type = this.prop(o, 'type');
+        /**
+         * "Change Directory" is not offered at all.
+         *
+         * There is nowhere else to put a saved game: they are the
+         * page's, kept for the tab, and no directory the button could
+         * name exists.  ScummVM disables it and leaves it sitting
+         * there; here it is not drawn either, so the dialog is only the
+         * choices that mean something.  Disabling still matters -- it
+         * is what stops the keyboard from landing on a button that is
+         * not on the screen.
+         */
+        if (o.name === 'changeDirI' || o.name === 'changeDirItem') {
+          this.setProp(o, 'state', (this.prop(o, 'state') | 4) & ~1);
+          return 0;
+        }
         const state = this.prop(o, 'state');
         const text = this.stringAt(this.prop(o, 'text'), o.scriptNo);
         const font = this.font(this.prop(o, 'font')) ?? this.font(0);
@@ -2757,6 +2889,8 @@ export class PMachine {
           }
         } else if (type === 3) {
           this.drawEditField(o, x, y, w, font, pen, back);
+        } else if (type === CONTROL_LIST) {
+          this.drawList(o, x, y, w, p.y + this.prop(o, 'nsBottom'), font, pen, back);
         } else if (font && text) {
           this.drawText(font, text, x, y, pen, Math.max(8, w || (WIDTH - x)));
         }
@@ -2782,9 +2916,9 @@ export class PMachine {
         if (this.prop(ctl, 'type') !== 3) return 0;
         if (this.prop(ev, 'type') !== EV.keyboard) return 0;
         const buf = this.prop(ctl, 'text');
-        if (!this.strings.has(buf)) return 0;
+        if (!this.hasString(buf)) return 0;
         const max = this.prop(ctl, 'max', 40);
-        let text = this.strings.get(buf)!;
+        let text = this.stringAt(buf, ctl.scriptNo);
         let cur = Math.max(0, Math.min(text.length, this.prop(ctl, 'cursor', text.length)));
         const key = this.prop(ev, 'message');
         let handled = true;
@@ -2802,7 +2936,7 @@ export class PMachine {
           }
         } else handled = false;                 // enter and the rest are the dialog's
         if (!handled) return 0;
-        this.strings.set(buf, text);
+        this.setString(buf, text);
         this.setProp(ctl, 'cursor', cur);
         this.setProp(ev, 'claimed', 1);
         // Redrawing is part of this kernel's job, not a later call's.
@@ -3052,27 +3186,87 @@ export class PMachine {
        * than restart so `Game::replay` takes it from there.
        */
       case 'SaveGame': {
-        const slot = s16(u16(args[1] ?? 0));
         const name = this.stringAt(args[2] ?? 0, f?.scriptNo);
+        const slot = this.slotToWrite(s16(u16(args[1] ?? 0)));
+        if (slot < 0) return 0;
         return this.putSave?.(slot, this.snapshot(), name) ? 1 : 0;
       }
       case 'RestoreGame': {
-        const slot = s16(u16(args[1] ?? 0));
-        const snap = this.getSave?.(slot) ?? null;
+        const snap = this.getSave?.(slotOf(s16(u16(args[1] ?? 0)))) ?? null;
         if (!snap) return 1;                       // true is the failure
         this.restoreRequested = snap;
         this.restartRequested = true;
         return 0;
       }
+      case 'CheckSaveGame':
+        return this.getSave?.(slotOf(s16(u16(args[1] ?? 0)))) ? 1 : 0;
+      /**
+       * The catalogue the game's own save dialog is built on.
+       *
+       * `GetSaveFiles(gameId, names, ids)` fills two buffers the script
+       * hands over: twenty fixed thirty-six byte slots of text, ended by
+       * an empty one, and a word per entry saying which saved game it
+       * is.  Both are addresses into the caller's temps, so the writing
+       * is into the stack -- see `STACK_SPACE`.
+       */
+      case 'GetSaveFiles': {
+        const list = (this.listSaves?.() ?? []).slice(0, MAX_SAVES);
+        const names = args[1] ?? 0, ids = args[2] ?? 0;
+        for (let i = 0; i < list.length; i++)
+          this.setString(names + i * SAVE_NAME_LEN, list[i].name.slice(0, SAVE_NAME_LEN - 1));
+        this.setString(names + list.length * SAVE_NAME_LEN, '');
+        this.writeWords(ids, list.map(e => e.slot + SAVE_ID_BASE));
+        return list.length;
+      }
+      /**
+       * How much room there is, which there always is.
+       *
+       * Early SCI0 asks with the path alone and wants a yes; later
+       * builds pass a sub-function, and ScummVM's answers are the ones
+       * used here: nought for the size a save would take, thirty-two
+       * megabytes of free space, and yes there is room.  Answering zero
+       * to all of it is what put King's Quest IV's dialog on the
+       * "this disk can hold no more saved games" path with the
+       * catalogue it had just been given still unread.
+       */
+      case 'CheckFreeSpace': {
+        const sub = args.length > 1 ? s16(u16(args[1])) : 2;
+        return sub === 0 ? 0 : sub === 1 ? 0x7FFF : 1;
+      }
+      /**
+       * Which drive the game is on, which is none.
+       *
+       * The scripts use it to decide whether to offer "Change
+       * Directory" and whether the saved games might be on a floppy
+       * that has to be swapped.  One device, never removable, and every
+       * path is the same path.
+       */
+      case 'DeviceInfo': {
+        const mode = s16(u16(a0));
+        if (mode === 0) { this.setString(args[2] ?? 0, '/'); return this.acc; }
+        if (mode === 1) { this.setString(a1, '/'); return this.acc; }
+        if (mode === 2)
+          return this.stringAt(a1, f?.scriptNo) === this.stringAt(args[2] ?? 0, f?.scriptNo) ? 1 : 0;
+        if (mode === 3) return 0;                  // never a floppy
+        // 5 and 6 name the catalogue and a save's file, which the games
+        // then delete by hand; there are no files, so nothing is named.
+        if (mode === 5 || mode === 6) { this.setString(a1, ''); return this.acc; }
+        return 0;
+      }
+      case 'ValidPath': return 1;
       case 'DisposeScript': {
         const n = u16(a0);
         if (this.frames.some(fr => fr.scriptNo === n)) this.unloadPending.add(n);
         else this.unloadScript(n);
         return args.length > 1 ? a1 : this.acc;
       }
+      case 'GetCWD': { this.setString(a0, '/'); return a0; }
+      case 'GetSaveDir': {
+        if (!this.saveDir) this.saveDir = this.makeString('/');
+        return this.saveDir;
+      }
       case 'FlushResources': case 'MemoryInfo':
       case 'SetSynonyms':
-      case 'GetSaveDir': case 'GetCWD':
       case 'FileIO':
       case 'FOpen': case 'FClose': case 'FGets': case 'FPuts':
         return 0;
@@ -3422,7 +3616,7 @@ export class PMachine {
   private display(args: number[], fromScript = 0): number {
     let i = 0;
     let text: string;
-    if (this.strings.has(args[0]) || isRef(args[0])) { text = this.stringAt(args[0], fromScript); i = 1; }
+    if (this.hasString(args[0]) || isRef(args[0])) { text = this.stringAt(args[0], fromScript); i = 1; }
     else { text = this.textLines(args[0])[args[1] ?? 0] ?? ''; i = 2; }
 
     let x = 0, y = 0, fg = 15, bg = -1, align = 0, width = 0, haveXY = false, save = false;
@@ -3717,6 +3911,35 @@ export class PMachine {
   }
 
   private buffers = new Map<string, number>();
+  /**
+   * The bytes behind the stack, which is what a string in a temp is.
+   *
+   * Shadowing rather than packing into `this.stack` keeps the word view
+   * the opcodes use and the byte view the string kernels use out of
+   * each other's way: no script writes a slot both ways.
+   */
+  private stackBytes = new Uint8Array(MAX_STACK * 2);
+
+  /** True when text written at this handle belongs in the stack's bytes. */
+  private stackText(h: number) { return isStackAddr(h); }
+
+  /** Write a NUL-terminated string wherever a handle points. */
+  setString(h: number, text: string) {
+    if (!this.stackText(h)) { this.strings.set(h, text); return; }
+    let p = refOffset(h);
+    for (let i = 0; i < text.length && p < this.stackBytes.length - 1; i++)
+      this.stackBytes[p++] = text.charCodeAt(i) & 0xFF;
+    if (p < this.stackBytes.length) this.stackBytes[p] = 0;
+  }
+
+  /** Whether a handle names somewhere text can be written. */
+  hasString(h: number) { return this.strings.has(h) || this.stackText(h); }
+
+  /** Clear the bytes a frame's temps occupy, so no older text shows through. */
+  private clearStackText(from: number, words: number) {
+    const at = from * 2, end = Math.min(this.stackBytes.length, at + words * 2);
+    if (at < end) this.stackBytes.fill(0, at, end);
+  }
   /** Which variable slot a `lea` handle stands for. */
   private bufferSlot = new Map<number, {
     kind: number; index: number; script: number;
@@ -3738,7 +3961,14 @@ export class PMachine {
     const stack = kind === 2 || kind === 3;
     const at = kind === 2 ? f.tempsBase + index
              : kind === 3 ? f.paramsBase + index : index;
-    const key = stack ? `s:${at}` : `${kind}:${index}:${script}`;
+    // A stack slot's address is its address; everything else gets a
+    // stand-in handle, one per slot, allocated the first time it is asked
+    // for.
+    if (stack) {
+      this.bufferSlot.set(stackAddr(at), { kind, index: at, script, frame: f });
+      return stackAddr(at);
+    }
+    const key = `${kind}:${index}:${script}`;
     let h = this.buffers.get(key);
     if (h === undefined) {
       h = this.alloc();
@@ -3750,7 +3980,7 @@ export class PMachine {
     // in some object's property from later writing into whatever method
     // happens to occupy those slots now -- which corrupts its temps, and
     // a method whose temp is its return value then returns nonsense.
-    this.bufferSlot.set(h, { kind, index: at, script, frame: stack ? f : undefined });
+    this.bufferSlot.set(h, { kind, index: at, script });
     return h;
   }
 
@@ -3758,7 +3988,14 @@ export class PMachine {
   private slotArray(h: number):
       { arr: Int32Array | number[]; index: number } | null {
     const slot = this.bufferSlot.get(h);
-    if (!slot) return null;
+    if (!slot) {
+      // An address the scripts worked out themselves -- the saved-game
+      // catalogue is one buffer walked in thirty-six byte strides -- so
+      // there is no `lea` on record for it.  It is still the stack.
+      if (!isStackAddr(h)) return null;
+      const word = refOffset(h) >> 1;
+      return word < this.stack.length ? { arr: this.stack, index: word } : null;
+    }
     if (slot.kind === 0) return { arr: this.globals, index: slot.index };
     if (slot.kind === 1) return { arr: this.localsOf(slot.script), index: slot.index };
     // The frame has returned, so those slots are somebody else's now.
@@ -3794,6 +4031,12 @@ export class PMachine {
   stringAt(ref: number, fromScript = 0): string {
     const made = this.strings.get(ref);
     if (made !== undefined) return made;
+    if (isStackAddr(ref)) {
+      let out = '';
+      for (let p = refOffset(ref); p < this.stackBytes.length && this.stackBytes[p]; p++)
+        out += String.fromCharCode(this.stackBytes[p]);
+      return out;
+    }
     const scriptNo = isRef(ref) ? refScript(ref) : fromScript;
     const off = isRef(ref) ? refOffset(ref) : ref;
     const sc = this.script(scriptNo);
