@@ -2215,11 +2215,16 @@ export class PMachine {
           this.currentPic = a0;
           this.pendingPic = true;
           this.picNotValid = 1;
-          // The low byte of the flags is how the picture is to arrive,
-          // and bit 15 asks for the opposite wipe to black first.
-          const flags = u16(args[1] ?? 0);
-          this.pendingWipe = wipeFor(flags);
-          if (flags & 0x8000) this.pendingWipe = [this.pendingWipe[0], true];
+          /**
+           * The low byte of the flags is how the picture is to arrive.
+           *
+           * Bit 15 is the blackout flag, and before SCI1 late it does
+           * nothing: the translation table gives each old number both a
+           * style and whether it blacks out, and ScummVM's `doit`
+           * overwrites what the flag said with what the table says.
+           * Those are the only versions here, so the table decides.
+           */
+          this.pendingWipe = wipeFor(u16(args[1] ?? 0));
         } catch { /* a picture that will not decode leaves the last one */ }
         return 0;
       }

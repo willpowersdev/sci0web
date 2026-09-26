@@ -34,32 +34,81 @@ export const SCREEN_HEIGHT = HEIGHT + STATUS_HEIGHT;
  * and 100 no transition at all.  11 to 17 are 2 to 8 again with the
  * blackout flag, which plays the opposite wipe to black first.
  */
+/**
+ * The ways a picture can arrive, named as ScummVM names them.
+ *
+ * A roll opens from the middle or closes onto it; a straight wipe is one
+ * edge sweeping across; a diagonal roll is all four edges at once, which
+ * is a square growing out of the centre or shrinking onto it; a scroll
+ * pushes the old picture off the side as the new one follows it on.
+ */
 export type Wipe = 'none' | 'pixels' | 'blocks' | 'fade'
-  | 'from-left' | 'from-right' | 'from-top' | 'from-bottom'
-  | 'open-across' | 'shut-across' | 'open-down' | 'shut-down';
+  | 'straight-from-left' | 'straight-from-right'
+  | 'straight-from-top' | 'straight-from-bottom'
+  | 'vroll-from-centre' | 'vroll-to-centre'
+  | 'hroll-from-centre' | 'hroll-to-centre'
+  | 'droll-from-centre' | 'droll-to-centre'
+  | 'scroll-left' | 'scroll-right' | 'scroll-up' | 'scroll-down';
 
+/**
+ * What the number in `DrawPic` meant before SCI1 late.
+ *
+ * Transcribed from ScummVM's `oldTransitionIDs`, which is the table the
+ * interpreter carried.  Four of these were guessed at here before and
+ * guessed wrong: 6 and 7 are the diagonal rolls, not the vertical ones,
+ * so King's Quest IV's first two pictures -- the Sierra logo and the one
+ * behind it -- came in as a pair of closing columns when what the game
+ * asked for, and what the game shows, is a square shrinking onto the
+ * middle of the screen.  40 to 43 are scrolls, where the old picture is
+ * pushed off the edge, not wipes that paint over it.
+ */
 const OLD_WIPES: Record<number, [Wipe, boolean]> = {
-  0: ['open-across', false], 1: ['open-down', false],
-  2: ['from-right', false], 3: ['from-left', false],
-  4: ['from-bottom', false], 5: ['from-top', false],
-  6: ['shut-across', false], 7: ['open-across', false],
+  0: ['vroll-from-centre', false], 1: ['hroll-from-centre', false],
+  2: ['straight-from-right', false], 3: ['straight-from-left', false],
+  4: ['straight-from-bottom', false], 5: ['straight-from-top', false],
+  6: ['droll-to-centre', false], 7: ['droll-from-centre', false],
   8: ['blocks', false],
-  9: ['shut-across', false], 10: ['shut-down', false],
-  11: ['from-right', true], 12: ['from-left', true],
-  13: ['from-bottom', true], 14: ['from-top', true],
-  15: ['shut-across', true], 16: ['open-across', true],
+  9: ['vroll-to-centre', false], 10: ['hroll-to-centre', false],
+  11: ['straight-from-right', true], 12: ['straight-from-left', true],
+  13: ['straight-from-bottom', true], 14: ['straight-from-top', true],
+  15: ['droll-to-centre', true], 16: ['droll-from-centre', true],
   17: ['blocks', true],
   18: ['pixels', false], 27: ['pixels', true],
   30: ['fade', false],
-  40: ['from-right', false], 41: ['from-left', false],
-  42: ['from-top', false], 43: ['from-bottom', false],
+  40: ['scroll-right', false], 41: ['scroll-left', false],
+  42: ['scroll-up', false], 43: ['scroll-down', false],
   100: ['none', false],
+};
+
+/**
+ * What a blacking-out transition runs first, and then in reverse.
+ *
+ * The styles that carry the flag do the thing twice: once painting
+ * black over the picture being left, going the other way, and then
+ * again bringing the new one in.  ScummVM's `blackoutTransitionIDs` is
+ * where the pairing comes from; everything not named here blacks out
+ * with nothing at all.
+ */
+const BLACKOUT_WIPES: Partial<Record<Wipe, Wipe>> = {
+  'vroll-from-centre': 'vroll-to-centre',
+  'hroll-from-centre': 'hroll-to-centre',
+  'straight-from-right': 'straight-from-left',
+  'straight-from-left': 'straight-from-right',
+  'straight-from-bottom': 'straight-from-top',
+  'straight-from-top': 'straight-from-bottom',
+  'droll-from-centre': 'droll-to-centre',
+  'droll-to-centre': 'droll-from-centre',
+  blocks: 'blocks',
+  pixels: 'pixels',
 };
 
 /** What SCI0 asked for, as a style and whether to black out first. */
 export function wipeFor(animationNr: number): [Wipe, boolean] {
   return OLD_WIPES[animationNr & 0xFF] ?? ['none', false];
 }
+
+/** A rectangle the transition is sweeping, as SCI keeps them. */
+interface WipeRect { x0: number; y0: number; x1: number; y1: number }
 
 export class Screen {
   /** Palette bytes, so a dither pair survives to the renderer. */
@@ -308,8 +357,11 @@ export class Screen {
    * is the same thing seen from the outside.
    */
   private wipe: {
-    style: Wipe; blackout: boolean; began: number; owed: number;
-    mask: number; step: number; a: number; b: number; done: boolean;
+    /** What is running now: the blackout pass, then the real one. */
+    style: Wipe; next: Wipe | null;
+    began: number; owed: number;
+    mask: number; step: number; a: number; done: boolean;
+    r: WipeRect[];
   } | null = null;
   /** The screen as it was, shown wherever the new one has not arrived. */
   private wipeFrom = new Uint8Array(WIDTH * HEIGHT);
@@ -340,35 +392,109 @@ export class Screen {
      * has not been reached yet shows the screen as it was.
      */
     this.wipeMask.fill(0);
-    this.wipe = { style, blackout, began: now, owed: 0, mask: 0x40, step: 0,
-                  a: 0, b: 0, done: false };
+    // A blackout runs the paired style first, painting the old picture
+    // black as it goes, and the asked-for one after it.
+    const first = blackout ? (BLACKOUT_WIPES[style] ?? 'none') : style;
+    this.wipe = { style: first, next: blackout ? style : null, began: now,
+                  owed: 0, mask: 0x40, step: 0, a: 0, done: false, r: [] };
+    if (first === 'none') this.nextPhase();
+    else this.setupPhase(first);
     this.advanceWipe(now);
   }
 
-  /** Say the new picture has reached a rectangle. */
+  /** The rectangles a style starts from, as SCI sets them up. */
+  private setupPhase(style: Wipe) {
+    const w = this.wipe;
+    if (!w) return;
+    w.style = style; w.owed = 0; w.mask = 0x40; w.step = 0; w.a = 0; w.done = false;
+    const mx = WIDTH >> 1, my = HEIGHT >> 1, hh = HEIGHT >> 1;
+    const rect = (x0: number, y0: number, x1: number, y1: number) => ({ x0, y0, x1, y1 });
+    switch (style) {
+      case 'vroll-from-centre':
+        w.r = [rect(mx - 1, 0, mx, HEIGHT), rect(mx, 0, mx + 1, HEIGHT)];
+        break;
+      case 'vroll-to-centre':
+        w.r = [rect(0, 0, 1, HEIGHT), rect(WIDTH - 1, 0, WIDTH, HEIGHT)];
+        break;
+      case 'hroll-from-centre':
+        w.r = [rect(0, my - 1, WIDTH, my), rect(0, my, WIDTH, my + 1)];
+        break;
+      case 'hroll-to-centre':
+        w.r = [rect(0, 0, WIDTH, 1), rect(0, HEIGHT - 1, WIDTH, HEIGHT)];
+        break;
+      case 'droll-from-centre': {
+        // Upper, lower, left, right, all four leaving the middle: the
+        // square that grows out of the centre of the screen.
+        const upper = rect(hh - 2, hh, WIDTH - hh + 1, hh + 1);
+        const lower = rect(upper.x0, upper.y0, upper.x1, upper.y1);
+        w.r = [upper, lower,
+               rect(upper.x0, upper.y0, upper.x0 + 1, lower.y1),
+               rect(upper.x1, upper.y0, upper.x1 + 1, lower.y1)];
+        break;
+      }
+      case 'droll-to-centre':
+        // And the same four closing on it: the square that shrinks.
+        w.r = [rect(0, 0, WIDTH, 1), rect(0, HEIGHT - 1, WIDTH, HEIGHT),
+               rect(0, 0, 1, HEIGHT), rect(WIDTH - 1, 0, WIDTH, HEIGHT)];
+        break;
+      default:
+        w.r = [];
+    }
+  }
+
+  /** The blackout pass is over; bring the new picture in. */
+  private nextPhase() {
+    const w = this.wipe;
+    if (!w) return;
+    const style = w.next;
+    w.next = null;
+    if (!style) { this.wipe = null; this.dirty = true; return; }
+    // The pass that has just finished has had its time; the next one
+    // starts its own count from there.
+    const began = w.began + w.owed;
+    this.setupPhase(style);
+    w.began = began;
+    this.dirty = true;
+  }
+
+  /**
+   * Say the transition has reached a rectangle.
+   *
+   * On the blackout pass that means painting the picture being left
+   * black; on the real one it means the new picture showing through.
+   */
   private wipeRect(x0: number, y0: number, x1: number, y1: number) {
+    const blacking = this.wipe?.next != null;
     for (let y = Math.max(0, y0); y < Math.min(HEIGHT, y1); y++) {
       const row = y * WIDTH;
-      for (let x = Math.max(0, x0); x < Math.min(WIDTH, x1); x++) this.wipeMask[row + x] = 1;
+      for (let x = Math.max(0, x0); x < Math.min(WIDTH, x1); x++) {
+        if (blacking) this.wipeFrom[row + x] = 0;
+        else this.wipeMask[row + x] = 1;
+      }
     }
     this.dirty = true;
   }
+
+  private mark(r: WipeRect) { this.wipeRect(r.x0, r.y0, r.x1, r.y1); }
 
   /**
    * Carry the wipe up to `now`.  Returns true while it is still going.
    */
   advanceWipe(now: number): boolean {
-    const w = this.wipe;
-    if (!w) return false;
-    const elapsed = now - w.began;
     let guard = 0;
-    while (!w.done && w.owed <= elapsed && guard++ < 200000) this.wipeOnce(w);
-    if (w.done) { this.wipe = null; this.dirty = true; return false; }
+    while (this.wipe && guard++ < 400000) {
+      const w = this.wipe;
+      if (w.done) { this.nextPhase(); continue; }
+      if (w.owed > now - w.began) break;
+      this.wipeOnce(w);
+    }
+    if (!this.wipe) { this.dirty = true; return false; }
     return true;
   }
 
   /** One unit of work, and what SCI charges for it in milliseconds. */
   private wipeOnce(w: NonNullable<Screen['wipe']>) {
+    const [p, q, u, v] = w.r;
     switch (w.style) {
       case 'pixels': {
         // The same shift register SCI uses, so the order is its order.
@@ -395,58 +521,99 @@ export class Screen {
         w.owed += 5;
         break;
       }
-      case 'from-left':
+      case 'straight-from-left':
         this.wipeRect(w.a, 0, w.a + 1, HEIGHT);
         if (++w.a >= WIDTH) w.done = true;
         if ((w.step++ & 1) === 0) w.owed += 2;
         break;
-      case 'from-right':
+      case 'straight-from-right':
         this.wipeRect(WIDTH - 1 - w.a, 0, WIDTH - w.a, HEIGHT);
         if (++w.a >= WIDTH) w.done = true;
         if ((w.step++ & 1) === 0) w.owed += 2;
         break;
-      case 'from-top':
+      case 'straight-from-top':
         this.wipeRect(0, w.a, WIDTH, w.a + 1);
         if (++w.a >= HEIGHT) w.done = true;
         w.owed += 4;
         break;
-      case 'from-bottom':
+      case 'straight-from-bottom':
         this.wipeRect(0, HEIGHT - 1 - w.a, WIDTH, HEIGHT - w.a);
         if (++w.a >= HEIGHT) w.done = true;
         w.owed += 4;
         break;
-      case 'open-across': {
-        // Two columns leaving the middle, as verticalRollFromCenter.
-        const mid = WIDTH >> 1;
-        this.wipeRect(mid - 1 - w.a, 0, mid - w.a, HEIGHT);
-        this.wipeRect(mid + w.a, 0, mid + w.a + 1, HEIGHT);
-        if (++w.a > mid) w.done = true;
+      case 'vroll-from-centre': {
+        if (p.x0 < 0) { p.x0++; p.x1++; }
+        if (q.x1 > WIDTH) { q.x0--; q.x1--; }
+        this.mark(p); p.x0--; p.x1--;
+        this.mark(q); q.x0++; q.x1++;
+        if (p.x1 <= 0 && q.x0 >= WIDTH) w.done = true;
         w.owed += 3;
         break;
       }
-      case 'shut-across': {
-        // And the same closing in on it.
-        this.wipeRect(w.a, 0, w.a + 1, HEIGHT);
-        this.wipeRect(WIDTH - 1 - w.a, 0, WIDTH - w.a, HEIGHT);
-        if (++w.a > (WIDTH >> 1)) w.done = true;
+      case 'vroll-to-centre': {
+        this.mark(p); p.x0++; p.x1++;
+        this.mark(q); q.x0--; q.x1--;
+        if (p.x0 >= q.x1) w.done = true;
         w.owed += 3;
         break;
       }
-      case 'open-down': {
-        const mid = HEIGHT >> 1;
-        this.wipeRect(0, mid - 1 - w.a, WIDTH, mid - w.a);
-        this.wipeRect(0, mid + w.a, WIDTH, mid + w.a + 1);
-        if (++w.a > mid) w.done = true;
+      case 'hroll-from-centre': {
+        if (p.y0 < 0) { p.y0++; p.y1++; }
+        if (q.y1 > HEIGHT) { q.y0--; q.y1--; }
+        this.mark(p); p.y0--; p.y1--;
+        this.mark(q); q.y0++; q.y1++;
+        if (p.y1 <= 0 && q.y0 >= HEIGHT) w.done = true;
         w.owed += 4;
         break;
       }
-      case 'shut-down': {
-        this.wipeRect(0, w.a, WIDTH, w.a + 1);
-        this.wipeRect(0, HEIGHT - 1 - w.a, WIDTH, HEIGHT - w.a);
-        if (++w.a > (HEIGHT >> 1)) w.done = true;
+      case 'hroll-to-centre': {
+        this.mark(p); p.y0++; p.y1++;
+        this.mark(q); q.y0--; q.y1--;
+        if (p.y0 >= q.y1) w.done = true;
         w.owed += 4;
         break;
       }
+      case 'droll-from-centre': {
+        if (p.y0 < 0) { p.y0++; p.y1++; u.y0++; v.y0++; }
+        if (q.y1 > HEIGHT) { q.y0--; q.y1--; u.y1--; v.y1--; }
+        if (u.x0 < 0) { u.x0++; u.x1++; p.x0++; q.x0++; }
+        if (v.x1 > WIDTH) { v.x0--; v.x1--; p.x1--; q.x1--; }
+        this.mark(p); p.y0--; p.y1--; p.x0--; p.x1++;
+        this.mark(q); q.y0++; q.y1++; q.x0--; q.x1++;
+        this.mark(u); u.x0--; u.x1--; u.y0--; u.y1++;
+        this.mark(v); v.x0++; v.x1++; v.y0--; v.y1++;
+        if (p.y0 < 0 && q.y1 > HEIGHT) w.done = true;
+        w.owed += 4;
+        break;
+      }
+      case 'droll-to-centre': {
+        this.mark(p); p.y0++; p.y1++; p.x0++; p.x1--;
+        this.mark(q); q.y0--; q.y1--; q.x0++; q.x1--;
+        this.mark(u); u.x0++; u.x1++;
+        this.mark(v); v.x0--; v.x1--;
+        if (p.y0 >= q.y1) w.done = true;
+        w.owed += 4;
+        break;
+      }
+      /**
+       * A scroll is the only one that moves what is already there.
+       *
+       * The old picture is pushed off one edge while the new one
+       * follows it on, so there is no mask to fill in: how far it has
+       * gone is the whole of the state, and the renderer reads both
+       * pictures at an offset.  Blacking out first is not a thing any
+       * of these do -- ScummVM's table pairs every scroll with nothing.
+       */
+      case 'scroll-left': case 'scroll-right':
+        if (++w.a >= WIDTH) w.done = true;
+        if ((w.step++ & 1) === 0) w.owed += 5;
+        this.dirty = true;
+        break;
+      case 'scroll-up': case 'scroll-down':
+        if (++w.a >= HEIGHT) w.done = true;
+        w.owed += 5;
+        this.dirty = true;
+        break;
       case 'fade': {
         // SCI fades the palette; with a fixed EGA palette the nearest
         // honest thing is to bring the picture up in even steps.
@@ -793,12 +960,34 @@ export class Screen {
         const o = (y * WIDTH + x) * 3;
         out[o] = c[0]; out[o + 1] = c[1]; out[o + 2] = c[2];
       }
-    const wiping = this.wipe !== null, black = this.wipe?.blackout ?? false;
+    const w = this.wipe;
+    /**
+     * A scroll shows both pictures at an offset, one leaving and one
+     * arriving; everything else shows the new picture where it has
+     * reached and the old one where it has not.
+     */
+    const slide = w && w.style.startsWith('scroll') ? w : null;
+    const a = slide?.a ?? 0;
     for (let y = 0; y < HEIGHT; y++) {
       for (let x = 0; x < WIDTH; x++) {
         const i = y * WIDTH + x;
-        const v = !wiping || this.wipeMask[i] ? this.visual[i]
-                : black ? 0 : this.wipeFrom[i];
+        let v: number;
+        if (slide) {
+          switch (slide.style) {
+            case 'scroll-left':
+              v = x < WIDTH - a ? this.wipeFrom[i + a]
+                : this.visual[y * WIDTH + x - (WIDTH - a)]; break;
+            case 'scroll-right':
+              v = x >= a ? this.wipeFrom[i - a]
+                : this.visual[y * WIDTH + WIDTH - a + x]; break;
+            case 'scroll-up':
+              v = y < HEIGHT - a ? this.wipeFrom[(y + a) * WIDTH + x]
+                : this.visual[(y - (HEIGHT - a)) * WIDTH + x]; break;
+            default:
+              v = y >= a ? this.wipeFrom[(y - a) * WIDTH + x]
+                : this.visual[(HEIGHT - a + y) * WIDTH + x]; break;
+          }
+        } else v = !w || this.wipeMask[i] ? this.visual[i] : this.wipeFrom[i];
         const c = this.undither ? BLENDED_RGB[v] : EGA_RGB[ditherPixel(v, x, y)];
         const o = ((y + top) * WIDTH + x) * 3;
         out[o] = c[0]; out[o + 1] = c[1]; out[o + 2] = c[2];
