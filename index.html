@@ -1,11 +1,32 @@
 <!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SCI0 Explorer</title>
+<meta name="description" content="Explore and play classic Sierra adventures in your browser.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="SCI0 Explorer">
+<meta property="og:title" content="SCI0 Explorer">
+<meta property="og:description" content="Explore and play classic Sierra adventures in your browser.">
+<!-- Static metadata lets message previews find the logo without running the game. -->
+<meta property="og:image" content="./assets/sierra-share.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Classic Sierra mountain logo">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="SCI0 Explorer">
+<meta name="twitter:description" content="Explore and play classic Sierra adventures in your browser.">
+<meta name="twitter:image" content="./assets/sierra-share.png">
+<meta name="twitter:image:alt" content="Classic Sierra mountain logo">
+<link rel="icon" type="image/png" sizes="256x256" href="./assets/sierra-icon.png">
+<link rel="apple-touch-icon" href="./assets/sierra-icon.png">
 <style>
   :root{--bg:#14141a;--panel:#1c1c24;--line:#31313d;--fg:#d6d6e0;--dim:#8a8a9a;--accent:#7fd1ff}
   *{box-sizing:border-box}
   body{margin:0;font:13px/1.5 ui-monospace,Menlo,monospace;background:var(--bg);color:var(--fg);
-       display:grid;grid-template-columns:300px 1fr;height:100vh}
+       display:grid;grid-template-columns:300px 1fr;height:100vh;height:100dvh}
   #side{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
   header{padding:12px;border-bottom:1px solid var(--line)}
   h1{font-size:14px;margin:0 0 8px}
@@ -24,6 +45,7 @@
   .exp:hover{background:var(--accent);color:#08080c}
   .sep{width:1px;align-self:stretch;background:var(--line);margin:0 4px}
   #stage{flex:1;display:grid;place-items:center;overflow:auto;padding:16px;min-height:0}
+  #cover{max-width:100%;max-height:100%;object-fit:contain;image-rendering:pixelated;background:#000}
   /* Text viewers want the whole width, top-aligned, not centred like a canvas. */
   #stage.text{place-items:start stretch}
   #text{margin:0;font:inherit;white-space:pre;tab-size:4}
@@ -64,8 +86,15 @@
   #dictate{position:fixed;top:0;left:0;width:2px;height:2px;opacity:0;
            border:0;padding:0;z-index:1}
 
+  @media(max-width:700px){
+    body:not(.play){grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
+    #side{max-height:38vh;border-right:0;border-bottom:1px solid var(--line)}
+    #stage{padding:12px}
+  }
   #mic.on{opacity:1;border-color:var(--accent);color:var(--accent)}
 </style>
+</head>
+<body>
 <div id="side">
   <header>
     <h1>SCI0 Explorer</h1>
@@ -80,8 +109,12 @@
 </div>
 <div id="main">
   <!-- #title is permanent; #controls is the part each viewer rebuilds. -->
-  <div id="bar"><span class="dim" id="title">nothing loaded</span><span id="controls"></span></div>
-  <div id="stage"><canvas id="cv" width="960" height="684"></canvas><pre id="text" hidden></pre></div>
+  <div id="bar"><span class="dim" id="title">King’s Quest IV</span><span id="controls"></span></div>
+  <div id="stage">
+    <img id="cover" src="./assets/kings-quest-iv.png" width="960" height="684"
+         alt="King’s Quest IV — original Sierra title screen" fetchpriority="high">
+    <canvas id="cv" width="960" height="684" hidden></canvas><pre id="text" hidden></pre>
+  </div>
 </div>
 <!--
   Dictation needs somewhere to dictate into.  macOS inserts recognised
@@ -116,3 +149,5 @@
   query is the build it wants; the page itself is never cached.
 -->
 <script type="module" src="./dist/app.js?v=f07232be"></script>
+</body>
+</html>
